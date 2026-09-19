@@ -551,20 +551,20 @@ static int block_manager_open_internal(block_manager_t **bm, const char *file_pa
             errno = hdr_errno;
             return -1;
         }
-        /* if O_DSYNC is available, pwrite already synced the header
-         * otherwise fall back to explicit fdatasync */
-        if (is_sync_full(new_bm) && !odsync_available())
+        /* A new block file has no records yet, but its header is required to reopen it.
+         * Persist that structural boundary even for TDB_SYNC_NONE: this does not
+         * change record-sync policy and prevents a crash from retaining the
+         * eight-byte extent with an unwritten, zero-filled header. */
+        if (fdatasync(new_bm->fd) != 0)
         {
-            if (fdatasync(new_bm->fd) != 0)
-            {
-                const int sync_errno = errno;
-                close(new_bm->fd);
-                free(new_bm);
-                *bm = NULL;
-                errno = sync_errno;
-                return -1;
-            }
+            const int sync_errno = errno;
+            close(new_bm->fd);
+            free(new_bm);
+            *bm = NULL;
+            errno = sync_errno;
+            return -1;
         }
+        tdb_fsync_parent_dir(file_path);
     }
 
     /* we set current_file_size if not already set by validation */
@@ -1994,6 +1994,35 @@ int block_manager_open(block_manager_t **bm, const char *file_path, const int sy
     if (!bm || !file_path) return -1;
     return block_manager_open_internal(bm, file_path, convert_sync_mode(sync_mode),
                                        BLOCK_MANAGER_PREALLOC_CHUNK);
+}
+
+int block_manager_repair_empty_zero_header(const char *file_path)
+{
+    if (!file_path) return -1;
+
+    const int fd = open(file_path, O_RDWR);
+    if (fd < 0) return -1;
+
+    struct STAT_STRUCT st;
+    unsigned char header[BLOCK_MANAGER_HEADER_SIZE];
+    int result = -1;
+
+    if (FSTAT_FUNC(fd, &st) == 0 && (uint64_t)st.st_size == BLOCK_MANAGER_HEADER_SIZE &&
+        pread(fd, header, sizeof(header), 0) == (ssize_t)sizeof(header))
+    {
+        unsigned char zero[BLOCK_MANAGER_HEADER_SIZE] = {0};
+        if (memcmp(header, zero, sizeof(header)) == 0 && write_header(fd) == 0 &&
+            fdatasync(fd) == 0)
+        {
+            result = 0;
+        }
+    }
+
+    const int saved_errno = errno;
+    const int close_result = close(fd);
+    if (result != 0) errno = saved_errno;
+    else if (close_result != 0) result = -1;
+    return result;
 }
 
 int block_manager_open_pre(block_manager_t **bm, const char *file_path, const int sync_mode,

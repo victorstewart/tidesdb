@@ -23132,12 +23132,25 @@ int tidesdb_create_column_family(tidesdb_t *db, const char *name,
 
         if (block_manager_open(&new_wal, wal_path, config->sync_mode) != 0)
         {
-            queue_free(cf->immutable_memtables);
-            skip_list_free(new_memtable);
-            free(cf->directory);
-            free(cf->name);
-            free(cf);
-            return TDB_ERR_IO;
+            /* Startup holds the database's exclusive file lock. An interrupted
+             * TDB_SYNC_NONE creation can leave only an eight-byte, all-zero WAL
+             * header. That file has no framed WAL record, so repair precisely
+             * that structural state and retry. Do not repair from public CF
+             * creation or treat nonzero or larger corrupt files as recoverable. */
+            if (!atomic_load_explicit(&db->is_recovering, memory_order_acquire) ||
+                !have_existing_wal || block_manager_repair_empty_zero_header(wal_path) != 0 ||
+                block_manager_open(&new_wal, wal_path, config->sync_mode) != 0)
+            {
+                queue_free(cf->immutable_memtables);
+                skip_list_free(new_memtable);
+                free(cf->directory);
+                free(cf->name);
+                free(cf);
+                return TDB_ERR_IO;
+            }
+            TDB_DEBUG_LOG(TDB_LOG_WARN,
+                          "CF '%s' repaired an interrupted empty WAL header: %s", name,
+                          wal_path);
         }
 
         if (have_existing_wal)
@@ -33741,13 +33754,23 @@ static int tidesdb_recover_database(tidesdb_t *db)
                     TDB_DEBUG_LOG(TDB_LOG_WARN,
                                   "Failed to create CF during recovery '%s' (error code: %d)",
                                   entry->d_name, create_result);
+                    closedir(dir);
+                    return create_result;
                 }
             }
 
             if (cf)
             {
                 TDB_DEBUG_LOG(TDB_LOG_INFO, "Recovering CF '%s'", entry->d_name);
-                tidesdb_recover_column_family(cf);
+                const int recover_result = tidesdb_recover_column_family(cf);
+                if (recover_result != TDB_SUCCESS)
+                {
+                    TDB_DEBUG_LOG(TDB_LOG_WARN,
+                                  "Failed to recover CF '%s' (error code: %d)", entry->d_name,
+                                  recover_result);
+                    closedir(dir);
+                    return recover_result;
+                }
             }
             else
             {

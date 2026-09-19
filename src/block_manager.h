@@ -170,6 +170,18 @@ typedef struct
 int block_manager_open(block_manager_t **bm, const char *file_path, int sync_mode);
 
 /**
+ * block_manager_repair_empty_zero_header
+ * rewrites a file only when it is exactly one block-manager header long and every
+ * header byte is zero.  Callers must restrict this to a known empty recovery
+ * artifact: arbitrary corrupt block-manager files must remain rejected.
+ *
+ * @param file_path existing file to inspect and, only for the exact zero-header
+ *                  shape, repair
+ * @return 0 when the valid header was written and synchronized, -1 otherwise
+ */
+int block_manager_repair_empty_zero_header(const char *file_path);
+
+/**
  * block_manager_open_pre
  * like block_manager_open but with a caller-chosen preallocation chunk. pass a small chunk for a
  * tiny file, or 0 to disable preallocation entirely so the file grows to exactly what is written

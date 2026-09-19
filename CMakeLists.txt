@@ -715,6 +715,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     add_executable(local_cache_tests test/local_cache__tests.c)
     add_executable(objstore_tests test/objstore__tests.c)
     add_executable(tidesdb_tests test/tidesdb__tests.c)
+    add_executable(wal_recovery_tests test/wal_recovery__tests.c)
     # crypto unit tests only make sense when the S3 crypto sources are compiled in
     if(TIDESDB_WITH_S3)
         add_executable(sha256_tests test/sha256__tests.c)
@@ -792,7 +793,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
     set(TIDESDB_TEST_LINK_TARGETS
             block_manager_tests compat_tests skip_list_tests compress_tests bloom_filter_tests
             manifest_tests clock_cache_tests queue_tests btree_tests local_cache_tests
-            objstore_tests tidesdb_tests tidesdb_bench)
+            objstore_tests tidesdb_tests wal_recovery_tests tidesdb_bench)
     if(TIDESDB_WITH_S3)
         list(APPEND TIDESDB_TEST_LINK_TARGETS sha256_tests hmac_sha256_tests)
     endif()
@@ -817,6 +818,7 @@ if(TIDESDB_BUILD_TESTS) # enable building tests and benchmarks
         add_test(NAME hmac_sha256_tests COMMAND hmac_sha256_tests)
     endif()
     add_test(NAME tidesdb_tests COMMAND tidesdb_tests)
+    add_test(NAME wal_recovery_tests COMMAND wal_recovery_tests)
 
     # copy required DLLs to build directory for Windows (MSVC and MinGW)
     if(WIN32)
