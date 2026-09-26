@@ -13,6 +13,12 @@
 #include "../src/sstable/vlog_internal.h" /* the segment table, for the retire guard test */
 #include "test_utils.h"
 
+#ifndef _WIN32
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 static int tests_passed = 0;
 static int tests_failed = 0;
 
@@ -702,6 +708,138 @@ void test_recover_appends_to_a_fresh_segment(void)
     vlog_close(v);
 }
 
+void test_reopen_empty_tail_does_not_add_segments(void)
+{
+    fresh_dir();
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, 0);
+    const size_t before = segment_count(v);
+    vlog_close(v);
+
+    /* An active segment with only its valid header has no immutable data to preserve. Reuse it
+     * across repeated idle reopens instead of leaving another header-only file behind. */
+    for (int i = 0; i < 64; i++)
+    {
+        v = open_store(TDB_COMPRESS_NONE, 0);
+        ASSERT_EQ((int)segment_count(v), (int)before);
+        vlog_close(v);
+    }
+
+    uint8_t *value = pattern(V_SMALL, 47);
+    v = open_store(TDB_COMPRESS_NONE, 0);
+    const vlog_id_t id = put(v, value, V_SMALL);
+    ASSERT_EQ((int)segment_count(v), (int)before);
+    assert_reads(v, id, value, V_SMALL);
+    vlog_close(v);
+
+    /* Once the reused tail contains data, recovery must resume the normal fresh-successor rule. */
+    v = open_store(TDB_COMPRESS_NONE, 0);
+    ASSERT_EQ((int)segment_count(v), (int)before + 1);
+    assert_reads(v, id, value, V_SMALL);
+    free(value);
+    vlog_close(v);
+}
+
+#ifndef _WIN32
+/* The registry can be opened and closed without writing a value. Populate valid header-only
+ * segments directly so this test exercises recovery rather than creating one active tail itself. */
+static int create_header_only_segment(uint64_t number)
+{
+    char name[VLOG_SEGMENT_NAME_MAX];
+    char path[512];
+    block_manager_t *bm = NULL;
+    if (vlog_segment_name(number, name, sizeof(name)) != VLOG_OK) return -1;
+    if (snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, name) >= (int)sizeof(path))
+        return -1;
+    if (block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) != 0) return -1;
+    return block_manager_close(bm);
+}
+
+void test_recover_many_segments_under_low_fd_limit(void)
+{
+    enum
+    {
+        RECOVERY_FD_LIMIT = 32,
+        RECOVERY_SEGMENTS = 48
+    };
+
+    fresh_dir();
+    for (uint64_t i = 0; i < RECOVERY_SEGMENTS; i++)
+        ASSERT_EQ(create_header_only_segment(i), 0);
+
+    const pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0)
+    {
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_max < RECOVERY_FD_LIMIT) _exit(2);
+        limit.rlim_cur = RECOVERY_FD_LIMIT;
+        if (setrlimit(RLIMIT_NOFILE, &limit) != 0) _exit(3);
+
+        const vlog_config_t cfg = {.sync_mode = BLOCK_MANAGER_SYNC_NONE};
+        vlog_t *v = NULL;
+        if (vlog_open(VDIR, &cfg, &v) != VLOG_OK || !v) _exit(4);
+
+        uint64_t numbers[VLOG_MAX_SEGMENTS];
+        size_t count = 0;
+        if (vlog_segment_scan_dir(VDIR, numbers, VLOG_MAX_SEGMENTS, &count) != VLOG_OK ||
+            count != RECOVERY_SEGMENTS)
+        {
+            vlog_close(v);
+            _exit(5);
+        }
+
+        static const uint8_t value[] = "fd-limited recovery tail";
+        vlog_id_t id = VLOG_ID_INVALID;
+        if (vlog_write(v, value, sizeof(value), NULL, 0, &id, NULL) != VLOG_OK ||
+            id == VLOG_ID_INVALID)
+        {
+            vlog_close(v);
+            _exit(6);
+        }
+        uint64_t number = 0;
+        if (vlog_segment_of(v, id, &number, NULL) != VLOG_OK ||
+            number != RECOVERY_SEGMENTS - 1)
+        {
+            vlog_close(v);
+            _exit(7);
+        }
+        uint8_t *got = NULL;
+        size_t got_len = 0;
+        if (vlog_read(v, id, &got, &got_len) != VLOG_OK || got_len != sizeof(value) ||
+            memcmp(got, value, sizeof(value)) != 0)
+        {
+            free(got);
+            vlog_close(v);
+            _exit(8);
+        }
+        free(got);
+        vlog_close(v);
+
+        v = NULL;
+        if (vlog_open(VDIR, &cfg, &v) != VLOG_OK || !v) _exit(9);
+        got = NULL;
+        got_len = 0;
+        if (vlog_read(v, id, &got, &got_len) != VLOG_OK || got_len != sizeof(value) ||
+            memcmp(got, value, sizeof(value)) != 0 ||
+            vlog_segment_scan_dir(VDIR, numbers, VLOG_MAX_SEGMENTS, &count) != VLOG_OK ||
+            count != RECOVERY_SEGMENTS + 1)
+        {
+            free(got);
+            vlog_close(v);
+            _exit(10);
+        }
+        free(got);
+        vlog_close(v);
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+#endif
+
 void test_recover_torn_tail_ignored(void)
 {
     fresh_dir();
@@ -742,6 +880,9 @@ void test_recover_torn_tail_ignored(void)
     /* recovery adopts what is intact and stops at the tear, so the value written before it reads
      * back and the torn one is simply absent rather than corrupt */
     v = open_store(TDB_COMPRESS_NONE, 0);
+    /* The intact prefix makes this a nonempty recovered tail, so it retains the established
+     * fresh-successor rule rather than being mistaken for an idle header-only segment. */
+    ASSERT_EQ((int)segment_count(v), 2);
     assert_reads(v, ia, a, V_SMALL);
     assert_gone(v, ib);
     free(a);
@@ -1269,6 +1410,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_recover_keeps_everything, tests_passed);
     RUN_TEST(test_recover_after_reclaim, tests_passed);
     RUN_TEST(test_recover_appends_to_a_fresh_segment, tests_passed);
+    RUN_TEST(test_reopen_empty_tail_does_not_add_segments, tests_passed);
+#ifndef _WIN32
+    RUN_TEST(test_recover_many_segments_under_low_fd_limit, tests_passed);
+#endif
     RUN_TEST(test_recover_torn_tail_ignored, tests_passed);
     RUN_TEST(test_read_detects_corruption, tests_passed);
     RUN_TEST(test_read_reports_corruption_when_the_chain_cannot_be_resolved, tests_passed);

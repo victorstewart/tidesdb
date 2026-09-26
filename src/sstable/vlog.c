@@ -203,13 +203,16 @@ static int vlog_index_put(vlog_t *v, uint64_t id, uint32_t segment, uint64_t off
  * @param v vlog handle
  * @param slot the segment's table slot
  * @param out_max_id raised to the highest id seen
+ * @param out_size receives the recovered physical size, after permissive tail recovery
  * @return VLOG_OK, VLOG_ERR_IO, or VLOG_ERR_MEMORY
  */
-static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *out_max_id)
+static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *out_max_id,
+                                uint64_t *out_size)
 {
     uint64_t fsize = 0;
     block_manager_t *bm = vlog_segment_ensure_open(v, slot);
     if (!bm || block_manager_get_size(bm, &fsize) != 0) return VLOG_ERR_IO;
+    *out_size = fsize;
 
     block_manager_cursor_t cur;
     if (block_manager_cursor_init_stack(&cur, bm) != 0) return VLOG_ERR_IO;
@@ -255,11 +258,14 @@ static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *out_max_id)
 
 /**
  * vlog_adopt_segments
- * opens every segment already in the store directory, ascending, and rebuilds the index from them
+ * opens every segment already in the store directory, ascending, and rebuilds the index from them.
+ * Recovered inactive segments give their descriptors back through the normal segment eviction
+ * owner. A header-only newest segment remains open for the caller to reuse as the active tail.
  * @param v vlog handle
+ * @param out_empty_tail_slot receives the header-only newest segment, or VLOG_MAX_SEGMENTS
  * @return VLOG_OK, VLOG_ERR_IO, VLOG_ERR_MEMORY, or VLOG_ERR_FULL
  */
-static int vlog_adopt_segments(vlog_t *v)
+static int vlog_adopt_segments(vlog_t *v, uint32_t *out_empty_tail_slot)
 {
     uint64_t *numbers = calloc(VLOG_MAX_SEGMENTS, sizeof(*numbers));
     if (!numbers) return VLOG_ERR_MEMORY;
@@ -267,12 +273,23 @@ static int vlog_adopt_segments(vlog_t *v)
     size_t count = 0;
     int rc = vlog_segment_scan_dir(v->dir, numbers, VLOG_MAX_SEGMENTS, &count);
     uint64_t max_id = 0;
+    *out_empty_tail_slot = VLOG_MAX_SEGMENTS;
 
     for (size_t i = 0; rc == VLOG_OK && i < count; i++)
     {
         uint32_t slot = 0;
+        uint64_t recovered_size = 0;
         rc = vlog_segment_open(v, numbers[i], &slot);
-        if (rc == VLOG_OK) rc = vlog_recover_segment(v, slot, &max_id);
+        if (rc == VLOG_OK) rc = vlog_recover_segment(v, slot, &max_id, &recovered_size);
+        if (rc != VLOG_OK) break;
+
+        /* A valid header-only tail has never held a value, so reusing it avoids creating one
+         * empty file for every open/close cycle. Every nonempty tail still gets a fresh active
+         * successor, including one whose permissive recovery retained an intact prefix. */
+        if (i + 1 == count && recovered_size == BLOCK_MANAGER_HEADER_SIZE)
+            *out_empty_tail_slot = slot;
+        else
+            (void)vlog_segment_evict(v, slot);
     }
     free(numbers);
 
@@ -299,7 +316,8 @@ int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out)
                                                                : VLOG_DEFAULT_SEGMENT_TARGET_BYTES;
     atomic_init(&v->next_id, 1);
     atomic_init(&v->next_number, 0);
-    atomic_init(&v->active_slot, 0);
+    /* No adopted segment is active yet, so recovery may evict every non-tail descriptor. */
+    atomic_init(&v->active_slot, VLOG_MAX_SEGMENTS);
     atomic_init(&v->seg_high, 0);
     pthread_mutex_init(&v->roll_mu, NULL);
     pthread_rwlock_init(&v->index_rw, NULL);
@@ -313,15 +331,23 @@ int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out)
         return VLOG_ERR_MEMORY;
     }
 
-    int rc = vlog_adopt_segments(v);
+    uint32_t empty_tail_slot = VLOG_MAX_SEGMENTS;
+    int rc = vlog_adopt_segments(v, &empty_tail_slot);
     if (rc == VLOG_OK)
     {
-        /* appends land in a fresh segment rather than extending the newest recovered one, so a
-         * segment sealed before a restart stays immutable across it and reclaim never has to
-         * reason about a segment that grew after it was adopted */
-        uint32_t slot = 0;
-        rc = vlog_segment_open(v, atomic_load(&v->next_number), &slot);
-        if (rc == VLOG_OK) atomic_store(&v->active_slot, slot);
+        if (empty_tail_slot != VLOG_MAX_SEGMENTS)
+        {
+            atomic_store(&v->active_slot, empty_tail_slot);
+        }
+        else
+        {
+            /* appends land in a fresh segment rather than extending the newest recovered one, so
+             * a segment sealed before a restart stays immutable across it and reclaim never has
+             * to reason about a segment that grew after it was adopted */
+            uint32_t slot = 0;
+            rc = vlog_segment_open(v, atomic_load(&v->next_number), &slot);
+            if (rc == VLOG_OK) atomic_store(&v->active_slot, slot);
+        }
     }
     if (rc != VLOG_OK)
     {
