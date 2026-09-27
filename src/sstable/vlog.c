@@ -606,9 +606,14 @@ int vlog_sync(vlog_t *v)
     for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
     {
         if (!vlog_segment_acquire(v, i)) continue;
+        const int was_resident =
+            atomic_load_explicit(&v->segments[i].bm, memory_order_acquire) != NULL;
         block_manager_t *bm = vlog_segment_ensure_open(v, i);
         if (!bm || block_manager_escalate_fsync(bm) != 0) rc = VLOG_ERR_IO;
         vlog_segment_release(v, i);
+        /* A full inspection must not repopulate the cold descriptor cache. The eviction owner
+         * preserves the active segment and refuses a reader that raced this release. */
+        if (!was_resident) (void)vlog_segment_evict(v, i);
     }
     return rc;
 }
@@ -627,12 +632,15 @@ int vlog_list_segments(vlog_t *v, vlog_segment_info_t *out, size_t max, size_t *
             vlog_segment_release(v, i);
             return VLOG_ERR_FULL;
         }
+        const int was_resident =
+            atomic_load_explicit(&v->segments[i].bm, memory_order_acquire) != NULL;
         uint64_t size = 0;
         block_manager_t *bm = vlog_segment_ensure_open(v, i);
         const int sized = bm ? block_manager_get_size(bm, &size) : -1;
         const int named =
             vlog_segment_name(v->segments[i].number, out[count].name, sizeof(out[count].name));
         vlog_segment_release(v, i);
+        if (!was_resident) (void)vlog_segment_evict(v, i);
         if (sized != 0 || named != VLOG_OK) return VLOG_ERR_IO;
         out[count].logical_size = size;
         count++;
@@ -679,6 +687,8 @@ int vlog_get_stats(vlog_t *v, vlog_stats_t *out)
     for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
     {
         if (!vlog_segment_acquire(v, i)) continue;
+        const int was_resident =
+            atomic_load_explicit(&v->segments[i].bm, memory_order_acquire) != NULL;
         uint64_t size = 0;
         block_manager_t *bm = vlog_segment_ensure_open(v, i);
         if (bm && block_manager_get_size(bm, &size) == 0) total += size;
@@ -686,6 +696,7 @@ int vlog_get_stats(vlog_t *v, vlog_stats_t *out)
         live += atomic_load_explicit(&v->segments[i].live_bytes, memory_order_relaxed);
         segments++;
         vlog_segment_release(v, i);
+        if (!was_resident) (void)vlog_segment_evict(v, i);
     }
 
     pthread_rwlock_rdlock(&v->index_rw);
