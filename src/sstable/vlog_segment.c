@@ -144,8 +144,9 @@ int vlog_segment_open(vlog_t *v, uint64_t number, uint32_t *out_slot)
      * retries rather than failing the store outright */
     block_manager_t *bm = NULL;
     const int opened =
-        v->fdm ? fd_manager_bm_open(v->fdm, &bm, path, v->sync_mode, FD_LABEL_VLOG_SEGMENT)
-               : block_manager_open(&bm, path, v->sync_mode);
+        v->fdm ? fd_manager_bm_open_pre(v->fdm, &bm, path, v->sync_mode, 0,
+                                         FD_LABEL_VLOG_SEGMENT)
+               : block_manager_open_pre(&bm, path, v->sync_mode, 0);
     if (opened != 0) return VLOG_ERR_IO;
     if (v->fdm) fd_manager_note_open(v->fdm, FD_LABEL_VLOG_SEGMENT);
 
@@ -336,8 +337,9 @@ block_manager_t *vlog_segment_ensure_open(vlog_t *v, uint32_t slot)
 
     block_manager_t *opened = NULL;
     const int rc =
-        v->fdm ? fd_manager_bm_open(v->fdm, &opened, path, v->sync_mode, FD_LABEL_VLOG_SEGMENT)
-               : block_manager_open(&opened, path, v->sync_mode);
+        v->fdm ? fd_manager_bm_open_pre(v->fdm, &opened, path, v->sync_mode, 0,
+                                         FD_LABEL_VLOG_SEGMENT)
+               : block_manager_open_pre(&opened, path, v->sync_mode, 0);
     if (rc != 0) return NULL;
 
     block_manager_t *expected = NULL;

@@ -15,6 +15,7 @@
 
 #ifndef _WIN32
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -766,6 +767,53 @@ static vlog_t *open_store_with_fdm(fd_manager_t *fdm, uint64_t target)
     ASSERT_TRUE(vlog_open(VDIR, &cfg, &v) == VLOG_OK);
     ASSERT_TRUE(v != NULL);
     return v;
+}
+
+static void assert_segment_is_not_preallocated(uint64_t number)
+{
+    char name[VLOG_SEGMENT_NAME_MAX];
+    char path[512];
+    struct stat st;
+    ASSERT_TRUE(vlog_segment_name(number, name, sizeof(name)) == VLOG_OK);
+    ASSERT_TRUE(snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, name) <
+                (int)sizeof(path));
+    ASSERT_EQ(stat(path, &st), 0);
+    ASSERT_TRUE((uint64_t)st.st_size < BLOCK_MANAGER_PREALLOC_CHUNK);
+}
+
+/* Controller-state VLOGs are frequently tiny. They must grow to written bytes rather than reserve
+ * a 64 MiB block-manager extent on every open or reopen. Exercise both direct and fd-manager paths. */
+static void test_vlog_segments_do_not_preallocate(void)
+{
+    uint8_t *value = pattern(V_SMALL, 83);
+    fresh_dir();
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, V_SMALL);
+    const vlog_id_t direct = put(v, value, V_SMALL);
+    (void)put(v, value, V_SMALL);
+    assert_segment_is_not_preallocated(0);
+    ASSERT_TRUE(vlog_evict_idle_segments(v, 0) >= 1);
+    assert_reads(v, direct, value, V_SMALL);
+    assert_segment_is_not_preallocated(0);
+    vlog_close(v);
+
+    v = open_store(TDB_COMPRESS_NONE, 0);
+    (void)put(v, value, V_SMALL);
+    assert_segment_is_not_preallocated(2);
+    vlog_close(v);
+
+    fresh_dir();
+    fd_manager_t fdm = {};
+    ASSERT_EQ(fd_manager_init(&fdm, 4), 0);
+    v = open_store_with_fdm(&fdm, V_SMALL);
+    const vlog_id_t managed = put(v, value, V_SMALL);
+    (void)put(v, value, V_SMALL);
+    assert_segment_is_not_preallocated(0);
+    ASSERT_TRUE(vlog_evict_idle_segments(v, 0) >= 1);
+    assert_reads(v, managed, value, V_SMALL);
+    assert_segment_is_not_preallocated(0);
+    vlog_close(v);
+    fd_manager_destroy(&fdm);
+    free(value);
 }
 
 typedef enum
@@ -1550,6 +1598,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_recover_appends_to_a_fresh_segment, tests_passed);
     RUN_TEST(test_reopen_empty_tail_does_not_add_segments, tests_passed);
 #ifndef _WIN32
+    RUN_TEST(test_vlog_segments_do_not_preallocate, tests_passed);
     RUN_TEST(test_vlog_sync_does_not_refill_vlog_descriptors, tests_passed);
     RUN_TEST(test_vlog_list_does_not_refill_vlog_descriptors, tests_passed);
     RUN_TEST(test_vlog_stats_does_not_refill_vlog_descriptors, tests_passed);
