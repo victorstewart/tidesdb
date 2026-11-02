@@ -31,3 +31,4 @@ vcpkg_installed
 .vs
 doc/*.pdf
 fuzz*
+.run/
