@@ -13,6 +13,13 @@
 #include "../src/sstable/vlog_internal.h" /* the segment table, for the retire guard test */
 #include "test_utils.h"
 
+#ifndef _WIN32
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 static int tests_passed = 0;
 static int tests_failed = 0;
 
@@ -724,7 +731,7 @@ void test_recover_after_reclaim(void)
     vlog_close(v);
 }
 
-void test_recover_appends_to_a_fresh_segment(void)
+void test_recover_appends_to_the_clean_active_segment(void)
 {
     fresh_dir();
     vlog_t *v = open_store(TDB_COMPRESS_NONE, 0);
@@ -733,15 +740,387 @@ void test_recover_appends_to_a_fresh_segment(void)
     const size_t before = segment_count(v);
     vlog_close(v);
 
-    /* reopening leaves what was there alone and appends into a new segment, so a segment sealed
-     * before a restart stays immutable across it */
+    /* The recovered newest segment has only complete, checksum-validated blocks, so appending to
+     * it preserves its ids and prevents a new segment for every clean registry reopen. */
     v = open_store(TDB_COMPRESS_NONE, 0);
-    ASSERT_EQ((int)segment_count(v), (int)before + 1);
+    ASSERT_EQ((int)segment_count(v), (int)before);
     const vlog_id_t id = put(v, val, V_MEDIUM);
     assert_reads(v, id, val, V_MEDIUM);
     free(val);
     vlog_close(v);
 }
+
+void test_reopen_empty_tail_does_not_add_segments(void)
+{
+    fresh_dir();
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, 0);
+    const size_t before = segment_count(v);
+    vlog_close(v);
+
+    /* An active segment with only its valid header has no immutable data to preserve. Reuse it
+     * across repeated idle reopens instead of leaving another header-only file behind. */
+    for (int i = 0; i < 64; i++)
+    {
+        v = open_store(TDB_COMPRESS_NONE, 0);
+        ASSERT_EQ((int)segment_count(v), (int)before);
+        vlog_close(v);
+    }
+
+    uint8_t *value = pattern(V_SMALL, 47);
+    v = open_store(TDB_COMPRESS_NONE, 0);
+    const vlog_id_t id = put(v, value, V_SMALL);
+    ASSERT_EQ((int)segment_count(v), (int)before);
+    assert_reads(v, id, value, V_SMALL);
+    vlog_close(v);
+
+    /* A clean nonempty tail is equally safe to reuse across later open/write/close cycles. */
+    v = open_store(TDB_COMPRESS_NONE, 0);
+    ASSERT_EQ((int)segment_count(v), (int)before);
+    assert_reads(v, id, value, V_SMALL);
+    free(value);
+    vlog_close(v);
+}
+
+/* Repeated registry-style open/write/close cycles must not consume a segment per clean reopen.
+ * The pre-fix implementation reaches the fixed 4096-slot limit in this exact shape. */
+void test_many_clean_reopens_keep_one_tail(void)
+{
+    fresh_dir();
+    uint8_t *value = pattern(V_SMALL, 71);
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, 0);
+    vlog_id_t id = put(v, value, V_SMALL);
+    vlog_close(v);
+
+    for (uint32_t reopen = 0; reopen <= VLOG_MAX_SEGMENTS; reopen++)
+    {
+        v = open_store(TDB_COMPRESS_NONE, 0);
+        ASSERT_EQ(segment_count(v), 1);
+        assert_reads(v, id, value, V_SMALL);
+        id = put(v, value, V_SMALL);
+        vlog_close(v);
+    }
+    free(value);
+}
+
+#ifndef _WIN32
+/* The registry can be opened and closed without writing a value. Populate valid header-only
+ * segments directly so this test exercises recovery rather than creating one active tail itself. */
+static int create_header_only_segment(uint64_t number)
+{
+    char name[VLOG_SEGMENT_NAME_MAX];
+    char path[512];
+    block_manager_t *bm = NULL;
+    if (vlog_segment_name(number, name, sizeof(name)) != VLOG_OK) return -1;
+    if (snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, name) >= (int)sizeof(path))
+        return -1;
+    if (block_manager_open(&bm, path, BLOCK_MANAGER_SYNC_NONE) != 0) return -1;
+    return block_manager_close(bm);
+}
+
+/* A controller registry can be reopened thousands of times. Populate every fixed slot, make the
+ * newest segment nonempty, then prove recovery keeps using that verified tail rather than trying
+ * to allocate segment VLOG_MAX_SEGMENTS. The pre-fix path failed on the first reopen here. */
+void test_reopen_full_nonempty_tail_does_not_exhaust_segments(void)
+{
+    fresh_dir();
+    for (uint64_t i = 0; i < VLOG_MAX_SEGMENTS; i++)
+        ASSERT_EQ(create_header_only_segment(i), 0);
+
+    uint8_t *value = pattern(V_SMALL, 73);
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, 0);
+    ASSERT_EQ(segment_count(v), VLOG_MAX_SEGMENTS);
+    vlog_id_t id = put(v, value, V_SMALL);
+    vlog_close(v);
+
+    for (int reopen = 0; reopen < 4; reopen++)
+    {
+        v = open_store(TDB_COMPRESS_NONE, 0);
+        ASSERT_EQ(segment_count(v), VLOG_MAX_SEGMENTS);
+        assert_reads(v, id, value, V_SMALL);
+        id = put(v, value, V_SMALL);
+        vlog_close(v);
+    }
+
+    uint64_t numbers[VLOG_MAX_SEGMENTS];
+    size_t count = 0;
+    ASSERT_EQ(vlog_segment_scan_dir(VDIR, numbers, VLOG_MAX_SEGMENTS, &count), VLOG_OK);
+    ASSERT_EQ(count, VLOG_MAX_SEGMENTS);
+    free(value);
+}
+
+static vlog_t *open_store_with_fdm(fd_manager_t *fdm, uint64_t target)
+{
+    ASSERT_TRUE(tidesdb_encoding_registry_init(&g_vlog_reg) == TDB_SUCCESS);
+    g_put_id_count = 0;
+    const vlog_config_t cfg = {.encodings = &g_vlog_reg,
+                               .sync_mode = BLOCK_MANAGER_SYNC_NONE,
+                               .segment_target_bytes = target,
+                               .fdm = fdm};
+    vlog_t *v = NULL;
+    ASSERT_TRUE(vlog_open(VDIR, &cfg, &v) == VLOG_OK);
+    ASSERT_TRUE(v != NULL);
+    return v;
+}
+
+static void assert_segment_is_not_preallocated(uint64_t number)
+{
+    char name[VLOG_SEGMENT_NAME_MAX];
+    char path[512];
+    struct stat st;
+    ASSERT_TRUE(vlog_segment_name(number, name, sizeof(name)) == VLOG_OK);
+    ASSERT_TRUE(snprintf(path, sizeof(path), "%s%s%s", VDIR, PATH_SEPARATOR, name) <
+                (int)sizeof(path));
+    ASSERT_EQ(stat(path, &st), 0);
+    ASSERT_TRUE((uint64_t)st.st_size < BLOCK_MANAGER_PREALLOC_CHUNK);
+}
+
+/* Controller-state VLOGs are frequently tiny. They must grow to written bytes rather than reserve
+ * a 64 MiB block-manager extent on every open or reopen. Exercise both direct and fd-manager paths. */
+static void test_vlog_segments_do_not_preallocate(void)
+{
+    uint8_t *value = pattern(V_SMALL, 83);
+    fresh_dir();
+    vlog_t *v = open_store(TDB_COMPRESS_NONE, V_SMALL);
+    const vlog_id_t direct = put(v, value, V_SMALL);
+    (void)put(v, value, V_SMALL);
+    assert_segment_is_not_preallocated(0);
+    ASSERT_TRUE(vlog_evict_idle_segments(v, 0) >= 1);
+    assert_reads(v, direct, value, V_SMALL);
+    assert_segment_is_not_preallocated(0);
+    vlog_close(v);
+
+    v = open_store(TDB_COMPRESS_NONE, 0);
+    (void)put(v, value, V_SMALL);
+    /* A verified nonempty tail is reused after recovery; reopening must not allocate segment 2. */
+    assert_segment_is_not_preallocated(1);
+    vlog_close(v);
+
+    fresh_dir();
+    fd_manager_t fdm = {};
+    ASSERT_EQ(fd_manager_init(&fdm, 4), 0);
+    v = open_store_with_fdm(&fdm, V_SMALL);
+    const vlog_id_t managed = put(v, value, V_SMALL);
+    (void)put(v, value, V_SMALL);
+    assert_segment_is_not_preallocated(0);
+    ASSERT_TRUE(vlog_evict_idle_segments(v, 0) >= 1);
+    assert_reads(v, managed, value, V_SMALL);
+    assert_segment_is_not_preallocated(0);
+    vlog_close(v);
+    fd_manager_destroy(&fdm);
+    free(value);
+}
+
+typedef enum
+{
+    VLOG_INSPECTION_SYNC,
+    VLOG_INSPECTION_LIST,
+    VLOG_INSPECTION_STATS,
+    VLOG_INSPECTION_MARK_DRAINABLE
+} vlog_inspection_t;
+
+static void test_inspection_sweep_does_not_refill_vlog_descriptors(vlog_inspection_t inspection)
+{
+    enum { INSPECTION_SEGMENTS = 48 };
+
+    fresh_dir();
+    for (uint64_t i = 0; i < INSPECTION_SEGMENTS; i++)
+        ASSERT_EQ(create_header_only_segment(i), 0);
+
+    fd_manager_t fdm = {};
+    ASSERT_EQ(fd_manager_init(&fdm, 8), 0);
+    vlog_t *v = open_store_with_fdm(&fdm, V_SMALL);
+    ASSERT_EQ(fd_manager_open_count(&fdm, FD_LABEL_VLOG_SEGMENT), 1);
+
+    uint8_t *value = pattern(V_SMALL, 49);
+    const vlog_id_t first = put(v, value, V_SMALL);
+    const vlog_id_t second = put(v, value, V_SMALL); /* seals 47 and makes 48 active */
+    uint64_t inactive_number = 0, inactive_disk = 0;
+    ASSERT_TRUE(vlog_segment_of(v, first, &inactive_number, &inactive_disk) == VLOG_OK);
+    ASSERT_EQ(inactive_number, INSPECTION_SEGMENTS - 1);
+    ASSERT_TRUE(vlog_evict_idle_segments(v, 0) >= 1);
+    ASSERT_EQ(fd_manager_open_count(&fdm, FD_LABEL_VLOG_SEGMENT), 1);
+
+    switch (inspection)
+    {
+        case VLOG_INSPECTION_SYNC:
+            ASSERT_TRUE(vlog_sync(v) == VLOG_OK);
+            break;
+        case VLOG_INSPECTION_LIST:
+        {
+            vlog_segment_info_t infos[VLOG_MAX_SEGMENTS];
+            size_t count = 0;
+            ASSERT_TRUE(vlog_list_segments(v, infos, VLOG_MAX_SEGMENTS, &count) == VLOG_OK);
+            ASSERT_EQ(count, INSPECTION_SEGMENTS + 1);
+            uint64_t listed_bytes = 0;
+            for (size_t i = 0; i < count; i++) listed_bytes += infos[i].logical_size;
+            ASSERT_EQ(listed_bytes,
+                      (INSPECTION_SEGMENTS + 1) * BLOCK_MANAGER_HEADER_SIZE +
+                          2 * block_manager_framed_size(VLOG_BLK_HDR_SIZE + V_SMALL));
+            break;
+        }
+        case VLOG_INSPECTION_STATS:
+        {
+            vlog_stats_t stats = {};
+            ASSERT_TRUE(vlog_get_stats(v, &stats) == VLOG_OK);
+            ASSERT_EQ(stats.segment_count, INSPECTION_SEGMENTS + 1);
+            ASSERT_EQ(stats.value_count, 2);
+            ASSERT_EQ(stats.file_size,
+                      (INSPECTION_SEGMENTS + 1) * BLOCK_MANAGER_HEADER_SIZE +
+                          2 * block_manager_framed_size(VLOG_BLK_HDR_SIZE + V_SMALL));
+            break;
+        }
+        case VLOG_INSPECTION_MARK_DRAINABLE:
+            /* The nonempty inactive segment must be examined by the compaction sweep. */
+            vlog_live_add(v, inactive_number, 1, 1);
+            ASSERT_TRUE(vlog_mark_drainable(v) >= 1);
+            break;
+    }
+    ASSERT_EQ(fd_manager_open_count(&fdm, FD_LABEL_VLOG_SEGMENT), 1);
+    assert_reads(v, first, value, V_SMALL);
+    assert_reads(v, second, value, V_SMALL);
+    ASSERT_TRUE(vlog_evict_idle_segments(v, 0) >= 1);
+    ASSERT_EQ(fd_manager_open_count(&fdm, FD_LABEL_VLOG_SEGMENT), 1);
+
+    vlog_close(v);
+    v = open_store_with_fdm(&fdm, V_SMALL);
+    assert_reads(v, first, value, V_SMALL);
+    assert_reads(v, second, value, V_SMALL);
+    free(value);
+    vlog_close(v);
+    ASSERT_EQ(fd_manager_open_count(&fdm, FD_LABEL_VLOG_SEGMENT), 0);
+    fd_manager_destroy(&fdm);
+}
+
+void test_vlog_sync_does_not_refill_vlog_descriptors(void)
+{
+    test_inspection_sweep_does_not_refill_vlog_descriptors(VLOG_INSPECTION_SYNC);
+}
+
+void test_vlog_list_does_not_refill_vlog_descriptors(void)
+{
+    test_inspection_sweep_does_not_refill_vlog_descriptors(VLOG_INSPECTION_LIST);
+}
+
+void test_vlog_stats_does_not_refill_vlog_descriptors(void)
+{
+    test_inspection_sweep_does_not_refill_vlog_descriptors(VLOG_INSPECTION_STATS);
+}
+
+void test_vlog_mark_drainable_does_not_refill_vlog_descriptors(void)
+{
+    test_inspection_sweep_does_not_refill_vlog_descriptors(VLOG_INSPECTION_MARK_DRAINABLE);
+}
+
+void test_recover_many_segments_under_low_fd_limit(void)
+{
+    enum
+    {
+        RECOVERY_FD_LIMIT = 32,
+        RECOVERY_SEGMENTS = 48
+    };
+
+    fresh_dir();
+    for (uint64_t i = 0; i < RECOVERY_SEGMENTS; i++)
+        ASSERT_EQ(create_header_only_segment(i), 0);
+
+    const pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0)
+    {
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_max < RECOVERY_FD_LIMIT) _exit(2);
+        limit.rlim_cur = RECOVERY_FD_LIMIT;
+        if (setrlimit(RLIMIT_NOFILE, &limit) != 0) _exit(3);
+
+        const vlog_config_t cfg = {.sync_mode = BLOCK_MANAGER_SYNC_NONE};
+        vlog_t *v = NULL;
+        if (vlog_open(VDIR, &cfg, &v) != VLOG_OK || !v) _exit(4);
+
+        uint64_t numbers[VLOG_MAX_SEGMENTS];
+        size_t count = 0;
+        if (vlog_segment_scan_dir(VDIR, numbers, VLOG_MAX_SEGMENTS, &count) != VLOG_OK ||
+            count != RECOVERY_SEGMENTS)
+        {
+            vlog_close(v);
+            _exit(5);
+        }
+
+        static const uint8_t value[] = "fd-limited recovery tail";
+        vlog_id_t id = VLOG_ID_INVALID;
+        if (vlog_write(v, value, sizeof(value), NULL, 0, &id, NULL) != VLOG_OK ||
+            id == VLOG_ID_INVALID)
+        {
+            vlog_close(v);
+            _exit(6);
+        }
+        uint64_t number = 0, disk = 0;
+        if (vlog_segment_of(v, id, &number, &disk) != VLOG_OK ||
+            number != RECOVERY_SEGMENTS - 1)
+        {
+            vlog_close(v);
+            _exit(7);
+        }
+        uint8_t *got = NULL;
+        size_t got_len = 0;
+        if (vlog_read(v, id, &got, &got_len) != VLOG_OK || got_len != sizeof(value) ||
+            memcmp(got, value, sizeof(value)) != 0)
+        {
+            free(got);
+            vlog_close(v);
+            _exit(8);
+        }
+        free(got);
+        vlog_close(v);
+
+        v = NULL;
+        if (vlog_open(VDIR, &cfg, &v) != VLOG_OK || !v) _exit(9);
+        got = NULL;
+        got_len = 0;
+        if (vlog_read(v, id, &got, &got_len) != VLOG_OK || got_len != sizeof(value) ||
+            memcmp(got, value, sizeof(value)) != 0 ||
+            vlog_segment_scan_dir(VDIR, numbers, VLOG_MAX_SEGMENTS, &count) != VLOG_OK ||
+            /* A clean recovered tail is reused rather than allocating segment 48. */
+            count != RECOVERY_SEGMENTS)
+        {
+            free(got);
+            vlog_close(v);
+            _exit(10);
+        }
+        free(got);
+
+        vlog_stats_t stats = {};
+        vlog_segment_info_t infos[VLOG_MAX_SEGMENTS];
+        size_t info_count = 0;
+        if (vlog_get_stats(v, &stats) != VLOG_OK ||
+            vlog_list_segments(v, infos, VLOG_MAX_SEGMENTS, &info_count) != VLOG_OK ||
+            info_count != RECOVERY_SEGMENTS || stats.segment_count != info_count ||
+            vlog_sync(v) != VLOG_OK)
+        {
+            vlog_close(v);
+            _exit(11);
+        }
+        vlog_live_add(v, number, 1, 1);
+        got = NULL;
+        got_len = 0;
+        /* The recovered segment remains active; it cannot be drained until rollover. */
+        if (vlog_mark_drainable(v) != 0 || vlog_read(v, id, &got, &got_len) != VLOG_OK ||
+            got_len != sizeof(value) || memcmp(got, value, sizeof(value)) != 0)
+        {
+            free(got);
+            vlog_close(v);
+            _exit(12);
+        }
+        free(got);
+        vlog_close(v);
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+#endif
 
 void test_recover_torn_tail_ignored(void)
 {
@@ -783,6 +1162,9 @@ void test_recover_torn_tail_ignored(void)
     /* recovery adopts what is intact and stops at the tear, so the value written before it reads
      * back and the torn one is simply absent rather than corrupt */
     v = open_store(TDB_COMPRESS_NONE, 0);
+    /* The intact prefix makes this a nonempty recovered tail, so it retains the established
+     * fresh-successor rule rather than being mistaken for an idle header-only segment. */
+    ASSERT_EQ((int)segment_count(v), 2);
     assert_reads(v, ia, a, V_SMALL);
     assert_gone(v, ib);
     free(a);
@@ -1362,7 +1744,18 @@ int main(int argc, char **argv)
     RUN_TEST(test_write_after_reclaim, tests_passed);
     RUN_TEST(test_recover_keeps_everything, tests_passed);
     RUN_TEST(test_recover_after_reclaim, tests_passed);
-    RUN_TEST(test_recover_appends_to_a_fresh_segment, tests_passed);
+    RUN_TEST(test_recover_appends_to_the_clean_active_segment, tests_passed);
+    RUN_TEST(test_reopen_empty_tail_does_not_add_segments, tests_passed);
+    RUN_TEST(test_many_clean_reopens_keep_one_tail, tests_passed);
+#ifndef _WIN32
+    RUN_TEST(test_reopen_full_nonempty_tail_does_not_exhaust_segments, tests_passed);
+    RUN_TEST(test_vlog_segments_do_not_preallocate, tests_passed);
+    RUN_TEST(test_vlog_sync_does_not_refill_vlog_descriptors, tests_passed);
+    RUN_TEST(test_vlog_list_does_not_refill_vlog_descriptors, tests_passed);
+    RUN_TEST(test_vlog_stats_does_not_refill_vlog_descriptors, tests_passed);
+    RUN_TEST(test_vlog_mark_drainable_does_not_refill_vlog_descriptors, tests_passed);
+    RUN_TEST(test_recover_many_segments_under_low_fd_limit, tests_passed);
+#endif
     RUN_TEST(test_recover_torn_tail_ignored, tests_passed);
     RUN_TEST(test_read_detects_corruption, tests_passed);
     RUN_TEST(test_read_reports_corruption_when_the_chain_cannot_be_resolved, tests_passed);

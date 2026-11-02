@@ -203,13 +203,17 @@ static int vlog_index_put(vlog_t *v, uint64_t id, uint32_t segment, uint64_t off
  * @param v vlog handle
  * @param slot the segment's table slot
  * @param out_max_id raised to the highest id seen
+ * @param out_clean receives whether every recovered block reached a clean tail. A false value
+ *                  means recovery skipped a torn or corrupt region, so callers must not append
+ *                  to this segment even though its intact prefix remains readable.
  * @return VLOG_OK, VLOG_ERR_IO, or VLOG_ERR_MEMORY
  */
-static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *out_max_id)
+static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *out_max_id, int *out_clean)
 {
     uint64_t fsize = 0;
     block_manager_t *bm = vlog_segment_ensure_open(v, slot);
     if (!bm || block_manager_get_size(bm, &fsize) != 0) return VLOG_ERR_IO;
+    *out_clean = 1;
 
     block_manager_cursor_t cur;
     if (block_manager_cursor_init_stack(&cur, bm) != 0) return VLOG_ERR_IO;
@@ -221,6 +225,7 @@ static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *out_max_id)
         block_manager_block_t *block = block_manager_cursor_read(&cur);
         if (!block)
         {
+            *out_clean = 0;
             if (block_manager_cursor_resync_past_hole(&cur) == 0) continue;
             if (block_manager_cursor_skip_corrupt(&cur) == 0) continue;
             break;
@@ -248,18 +253,26 @@ static int vlog_recover_segment(vlog_t *v, uint32_t slot, uint64_t *out_max_id)
         }
         block_manager_block_free(block);
         if (rc != VLOG_OK) break;
-        if (block_manager_cursor_next(&cur) != 0) break;
+        if (block_manager_cursor_next(&cur) != 0)
+        {
+            *out_clean = 0;
+            break;
+        }
     }
     return rc;
 }
 
 /**
  * vlog_adopt_segments
- * opens every segment already in the store directory, ascending, and rebuilds the index from them
+ * opens every segment already in the store directory, ascending, and rebuilds the index from them.
+ * Recovered inactive segments give their descriptors back through the normal segment eviction
+ * owner. The newest clean segment remains open for the caller to reuse as the active tail. A
+ * tail that needed permissive recovery remains immutable and receives a fresh successor.
  * @param v vlog handle
+ * @param out_reusable_tail_slot receives the clean newest segment, or VLOG_MAX_SEGMENTS
  * @return VLOG_OK, VLOG_ERR_IO, VLOG_ERR_MEMORY, or VLOG_ERR_FULL
  */
-static int vlog_adopt_segments(vlog_t *v)
+static int vlog_adopt_segments(vlog_t *v, uint32_t *out_reusable_tail_slot)
 {
     uint64_t *numbers = calloc(VLOG_MAX_SEGMENTS, sizeof(*numbers));
     if (!numbers) return VLOG_ERR_MEMORY;
@@ -267,12 +280,24 @@ static int vlog_adopt_segments(vlog_t *v)
     size_t count = 0;
     int rc = vlog_segment_scan_dir(v->dir, numbers, VLOG_MAX_SEGMENTS, &count);
     uint64_t max_id = 0;
+    *out_reusable_tail_slot = VLOG_MAX_SEGMENTS;
 
     for (size_t i = 0; rc == VLOG_OK && i < count; i++)
     {
         uint32_t slot = 0;
+        int recovered_clean = 0;
         rc = vlog_segment_open(v, numbers[i], &slot);
-        if (rc == VLOG_OK) rc = vlog_recover_segment(v, slot, &max_id);
+        if (rc == VLOG_OK)
+            rc = vlog_recover_segment(v, slot, &max_id, &recovered_clean);
+        if (rc != VLOG_OK) break;
+
+        /* The newest clean tail was fully recovered from framed blocks and can safely continue
+         * appending. This prevents one segment per clean open/write/close cycle. A tail whose
+         * permissive scan skipped anything stays immutable, preserving recovery's safe boundary. */
+        if (i + 1 == count && recovered_clean)
+            *out_reusable_tail_slot = slot;
+        else
+            (void)vlog_segment_evict(v, slot);
     }
     free(numbers);
 
@@ -299,7 +324,8 @@ int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out)
                                                                : VLOG_DEFAULT_SEGMENT_TARGET_BYTES;
     atomic_init(&v->next_id, 1);
     atomic_init(&v->next_number, 0);
-    atomic_init(&v->active_slot, 0);
+    /* No adopted segment is active yet, so recovery may evict every non-tail descriptor. */
+    atomic_init(&v->active_slot, VLOG_MAX_SEGMENTS);
     atomic_init(&v->seg_high, 0);
     pthread_mutex_init(&v->roll_mu, NULL);
     pthread_rwlock_init(&v->index_rw, NULL);
@@ -313,15 +339,23 @@ int vlog_open(const char *dir, const vlog_config_t *config, vlog_t **out)
         return VLOG_ERR_MEMORY;
     }
 
-    int rc = vlog_adopt_segments(v);
+    uint32_t reusable_tail_slot = VLOG_MAX_SEGMENTS;
+    int rc = vlog_adopt_segments(v, &reusable_tail_slot);
     if (rc == VLOG_OK)
     {
-        /* appends land in a fresh segment rather than extending the newest recovered one, so a
-         * segment sealed before a restart stays immutable across it and reclaim never has to
-         * reason about a segment that grew after it was adopted */
-        uint32_t slot = 0;
-        rc = vlog_segment_open(v, atomic_load(&v->next_number), &slot);
-        if (rc == VLOG_OK) atomic_store(&v->active_slot, slot);
+        if (reusable_tail_slot != VLOG_MAX_SEGMENTS)
+        {
+            atomic_store(&v->active_slot, reusable_tail_slot);
+        }
+        else
+        {
+            /* appends land in a fresh segment rather than extending the newest recovered one, so
+             * a segment sealed before a restart stays immutable across it and reclaim never has
+             * to reason about a segment that grew after it was adopted */
+            uint32_t slot = 0;
+            rc = vlog_segment_open(v, atomic_load(&v->next_number), &slot);
+            if (rc == VLOG_OK) atomic_store(&v->active_slot, slot);
+        }
     }
     if (rc != VLOG_OK)
     {
@@ -580,9 +614,14 @@ int vlog_sync(vlog_t *v)
     for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
     {
         if (!vlog_segment_acquire(v, i)) continue;
+        const int was_resident =
+            atomic_load_explicit(&v->segments[i].bm, memory_order_acquire) != NULL;
         block_manager_t *bm = vlog_segment_ensure_open(v, i);
         if (!bm || block_manager_escalate_fsync(bm) != 0) rc = VLOG_ERR_IO;
         vlog_segment_release(v, i);
+        /* A full inspection must not repopulate the cold descriptor cache. The eviction owner
+         * preserves the active segment and refuses a reader that raced this release. */
+        if (!was_resident) (void)vlog_segment_evict(v, i);
     }
     return rc;
 }
@@ -601,12 +640,15 @@ int vlog_list_segments(vlog_t *v, vlog_segment_info_t *out, size_t max, size_t *
             vlog_segment_release(v, i);
             return VLOG_ERR_FULL;
         }
+        const int was_resident =
+            atomic_load_explicit(&v->segments[i].bm, memory_order_acquire) != NULL;
         uint64_t size = 0;
         block_manager_t *bm = vlog_segment_ensure_open(v, i);
         const int sized = bm ? block_manager_get_size(bm, &size) : -1;
         const int named =
             vlog_segment_name(v->segments[i].number, out[count].name, sizeof(out[count].name));
         vlog_segment_release(v, i);
+        if (!was_resident) (void)vlog_segment_evict(v, i);
         if (sized != 0 || named != VLOG_OK) return VLOG_ERR_IO;
         out[count].logical_size = size;
         count++;
@@ -653,6 +695,8 @@ int vlog_get_stats(vlog_t *v, vlog_stats_t *out)
     for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
     {
         if (!vlog_segment_acquire(v, i)) continue;
+        const int was_resident =
+            atomic_load_explicit(&v->segments[i].bm, memory_order_acquire) != NULL;
         uint64_t size = 0;
         block_manager_t *bm = vlog_segment_ensure_open(v, i);
         if (bm && block_manager_get_size(bm, &size) == 0) total += size;
@@ -660,6 +704,7 @@ int vlog_get_stats(vlog_t *v, vlog_stats_t *out)
         live += atomic_load_explicit(&v->segments[i].live_bytes, memory_order_relaxed);
         segments++;
         vlog_segment_release(v, i);
+        if (!was_resident) (void)vlog_segment_evict(v, i);
     }
 
     pthread_rwlock_rdlock(&v->index_rw);

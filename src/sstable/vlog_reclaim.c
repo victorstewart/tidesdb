@@ -205,6 +205,8 @@ int vlog_mark_drainable(vlog_t *v)
     for (uint32_t i = 0; i < high && i < VLOG_MAX_SEGMENTS; i++)
     {
         if (!vlog_segment_acquire(v, i)) continue;
+        const int was_resident =
+            atomic_load_explicit(&v->segments[i].bm, memory_order_acquire) != NULL;
 
         /* read per iteration, as the reclaim pass does. an appender rolling while this loop runs
          * moves the active slot, and a reading hoisted before it started would let the segment now
@@ -218,13 +220,16 @@ int vlog_mark_drainable(vlog_t *v)
         /* the segment taking appends is never marked. it is still growing, so the share of it that
          * is live says nothing yet, and rewriting values into the very segment being emptied would
          * not converge */
-        const int worth = i != active && live > 0 &&
-                          block_manager_get_size(vlog_segment_ensure_open(v, i), &size) == 0 &&
+        block_manager_t *bm = i != active && live > 0 ? vlog_segment_ensure_open(v, i) : NULL;
+        const int worth = i != active && live > 0 && bm &&
+                          block_manager_get_size(bm, &size) == 0 &&
                           live <= size / VLOG_RECLAIM_LIVE_DIVISOR;
 
         atomic_store_explicit(&v->segments[i].draining, worth, memory_order_relaxed);
         if (worth) marked++;
         vlog_segment_release(v, i);
+        /* Marking every segment is inspection, not a cache-warming read. */
+        if (!was_resident) (void)vlog_segment_evict(v, i);
     }
     return marked;
 }
